@@ -1,3 +1,4 @@
+# server.py - PostgreSQL version
 import os
 import json
 import logging
@@ -7,7 +8,12 @@ from flask_cors import CORS
 from functools import wraps
 import threading
 import time
-from bson import ObjectId
+from dotenv import load_dotenv
+
+from db import check_database_connection
+
+# Load environment variables
+load_dotenv()
 
 # Database import
 try:
@@ -17,7 +23,8 @@ try:
         create_startup, get_startup, get_startups_by_owner,
         get_pending_startups, get_active_startups, update_startup_status,
         get_statistics, get_all_users, get_recent_users, get_recent_startups,
-        get_completed_startups, get_rejected_startups, get_startup_members
+        get_completed_startups, get_rejected_startups, get_startup_members,
+        save_broadcast_message, log_admin_action
     )
     DB_AVAILABLE = True
 except ImportError as e:
@@ -29,19 +36,25 @@ except ImportError as e:
 
 # Bot import
 try:
-    from main import bot
-    BOT_AVAILABLE = True
+    import telebot
+    BOT_TOKEN = os.getenv('BOT_TOKEN')
+    if BOT_TOKEN:
+        bot = telebot.TeleBot(BOT_TOKEN)
+        BOT_AVAILABLE = True
+    else:
+        print("⚠️ BOT_TOKEN environment variable o'rnatilmagan!")
+        BOT_AVAILABLE = False
 except ImportError as e:
-    print(f"⚠️ Bot import xatosi: {e}")
+    print(f"⚠️ Telegram bot import xatosi: {e}")
     BOT_AVAILABLE = False
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
-# Render uchun secret key
-SECRET_KEY = os.environ.get('SECRET_KEY')
-if not SECRET_KEY:
-    print("⚠️ SECRET_KEY environment variable o'rnatilmagan!")
-    SECRET_KEY = 'dev-secret-key-render-' + str(os.urandom(24).hex())
+# Environment variables
+SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key-' + str(os.urandom(24).hex()))
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
+ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@garajhub.uz')
+CHANNEL_USERNAME = os.environ.get('CHANNEL_USERNAME', '@GarajHub_uz')
 
 app.secret_key = SECRET_KEY
 app.config['SESSION_TYPE'] = 'filesystem'
@@ -57,9 +70,9 @@ logger = logging.getLogger(__name__)
 # Adminlar ro'yxati
 ADMINS = {
     'admin': {
-        'password': os.environ.get('ADMIN_PASSWORD', 'admin123'),
+        'password': ADMIN_PASSWORD,
         'full_name': 'Super Admin',
-        'email': os.environ.get('ADMIN_EMAIL', 'admin@garajhub.uz'),
+        'email': ADMIN_EMAIL,
         'role': 'superadmin'
     }
 }
@@ -114,6 +127,12 @@ def login():
             session['admin_name'] = admin['full_name']
             session.permanent = True
             
+            # Log admin login
+            log_admin_action(username, 'login', {
+                'ip': request.remote_addr,
+                'user_agent': request.headers.get('User-Agent')
+            }, request.remote_addr)
+            
             logger.info(f"Admin kirildi: {username}")
             return jsonify({
                 'success': True,
@@ -153,23 +172,25 @@ def check_auth():
 @app.route('/api/statistics')
 @login_required
 def get_statistics_data():
-    """Statistika ma'lumotlari - FAQAT REAL MA'LUMOTLAR"""
+    """Statistika ma'lumotlari"""
     try:
         if not DB_AVAILABLE:
             return jsonify({'success': False, 'error': 'Database ulanmagan'}), 500
         
         stats = get_statistics()
         
-        # Bugungi yangi foydalanuvchilar
+        # Activity rate calculation
         today = datetime.now().strftime('%Y-%m-%d')
         recent_users = get_recent_users(1000)
         new_today = sum(1 for user in recent_users if user.get('joined_at', '').startswith(today))
         
-        # Faollik darajasi (oxirgi 7 kundagi faol foydalanuvchilar)
         week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
         active_last_week = sum(1 for user in recent_users if user.get('joined_at', '') >= week_ago)
         total_users = stats.get('total_users', 1)
         activity_rate = round((active_last_week / total_users) * 100) if total_users > 0 else 0
+        
+        # Log admin action
+        log_admin_action(session.get('admin_username'), 'view_statistics')
         
         return jsonify({
             'success': True,
@@ -181,7 +202,7 @@ def get_statistics_data():
                 'completed_startups': stats.get('completed_startups', 0),
                 'rejected_startups': stats.get('rejected_startups', 0),
                 'new_today': new_today,
-                'activity_rate': min(activity_rate, 100)  # 100% dan oshmasligi uchun
+                'activity_rate': min(activity_rate, 100)
             }
         })
     except Exception as e:
@@ -191,7 +212,7 @@ def get_statistics_data():
 @app.route('/api/users')
 @login_required
 def get_users():
-    """Foydalanuvchilar ro'yxati - FAQAT REAL MA'LUMOTLAR"""
+    """Foydalanuvchilar ro'yxati"""
     try:
         if not DB_AVAILABLE:
             return jsonify({'success': False, 'error': 'Database ulanmagan'}), 500
@@ -200,8 +221,8 @@ def get_users():
         per_page = int(request.args.get('per_page', 20))
         search = request.args.get('search', '')
         
-        # DB dan foydalanuvchilarni olish
-        users = get_recent_users(10000)  # Ko'proq foydalanuvchi olish
+        # Database dan foydalanuvchilarni olish
+        users = get_recent_users(10000)
         
         # Filtrlash
         if search:
@@ -219,7 +240,7 @@ def get_users():
                     filtered_users.append(user)
             users = filtered_users
         
-        # Tartiblash (eng yangilari birinchi)
+        # Tartiblash
         users.sort(key=lambda x: x.get('joined_at', ''), reverse=True)
         
         # Pagination
@@ -231,26 +252,23 @@ def get_users():
         # Formatlash
         formatted_users = []
         for user in paginated_users:
-            # Joined_at ni formatlash
-            joined_at = user.get('joined_at', '')
-            if isinstance(joined_at, datetime):
-                joined_at = joined_at.strftime('%Y-%m-%d %H:%M')
-            elif isinstance(joined_at, str) and len(joined_at) > 10:
-                joined_at = joined_at[:16]  # Faqat sana va soat
-            elif not joined_at:
-                joined_at = 'Noma\'lum'
-            
             formatted_users.append({
-                'id': str(user.get('_id', user.get('user_id', ''))),
+                'id': user.get('user_id', ''),
                 'user_id': user.get('user_id', ''),
                 'first_name': user.get('first_name', 'Noma\'lum'),
                 'last_name': user.get('last_name', ''),
                 'username': user.get('username', ''),
                 'phone': user.get('phone', 'Telefon kiritilmagan'),
                 'bio': user.get('bio', ''),
-                'joined_at': joined_at,
-                'status': 'active'
+                'joined_at': user.get('joined_at', 'Noma\'lum'),
+                'status': user.get('status', 'active')
             })
+        
+        # Log admin action
+        log_admin_action(session.get('admin_username'), 'view_users', {
+            'page': page,
+            'search': search
+        })
         
         return jsonify({
             'success': True,
@@ -273,7 +291,7 @@ def get_users():
 @app.route('/api/startups')
 @login_required
 def get_startups_list():
-    """Startaplar ro'yxati - FAQAT REAL MA'LUMOTLAR"""
+    """Startaplar ro'yxati"""
     try:
         if not DB_AVAILABLE:
             return jsonify({'success': False, 'error': 'Database ulanmagan'}), 500
@@ -283,7 +301,7 @@ def get_startups_list():
         search = request.args.get('search', '')
         status = request.args.get('status', 'all')
         
-        # DB dan startaplarni olish
+        # Database dan startaplarni olish
         startups_data = []
         total = 0
         
@@ -322,20 +340,9 @@ def get_startups_list():
         # Formatlash
         formatted_startups = []
         for startup in startups_data:
-            # Muallif ma'lumotlari
-            owner = get_user(startup.get('owner_id')) if startup.get('owner_id') else None
-            owner_name = "Noma'lum"
-            owner_id = startup.get('owner_id', '')
-            if owner:
-                first_name = owner.get('first_name', '')
-                last_name = owner.get('last_name', '')
-                owner_name = f"{first_name} {last_name}".strip()
-                if not owner_name:
-                    owner_name = f"User {owner_id}"
-            
             # A'zolar soni
             try:
-                members, member_count = get_startup_members(str(startup.get('_id', '')), 1, 1000)
+                members, member_count = get_startup_members(startup.get('id', ''), 1, 1000)
             except:
                 member_count = 0
             
@@ -347,28 +354,26 @@ def get_startups_list():
                 'rejected': '❌ Rad etilgan'
             }
             
-            # Created_at ni formatlash
-            created_at = startup.get('created_at', '')
-            if isinstance(created_at, datetime):
-                created_at = created_at.strftime('%Y-%m-%d %H:%M')
-            elif isinstance(created_at, str) and len(created_at) > 10:
-                created_at = created_at[:16]
-            elif not created_at:
-                created_at = 'Noma\'lum'
-            
             formatted_startups.append({
-                'id': str(startup.get('_id', '')),
+                'id': startup.get('id', ''),
                 'name': startup.get('name', 'Noma\'lum'),
-                'owner_name': owner_name,
-                'owner_id': owner_id,
+                'owner_name': f"{startup.get('owner_first_name', '')} {startup.get('owner_last_name', '')}".strip(),
+                'owner_id': startup.get('owner_id', ''),
                 'status': startup.get('status', 'pending'),
                 'status_text': status_texts.get(startup.get('status', 'pending'), startup.get('status', 'pending')),
-                'created_at': created_at,
+                'created_at': startup.get('created_at', 'Noma\'lum'),
                 'description': startup.get('description', ''),
                 'member_count': member_count
             })
         
         total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+        
+        # Log admin action
+        log_admin_action(session.get('admin_username'), 'view_startups', {
+            'page': page,
+            'status': status,
+            'search': search
+        })
         
         return jsonify({
             'success': True,
@@ -387,7 +392,7 @@ def get_startups_list():
             'error': str(e)
         }), 500
 
-@app.route('/api/startup/<startup_id>', methods=['GET'])
+@app.route('/api/startup/<int:startup_id>', methods=['GET'])
 @login_required
 def get_startup_details(startup_id):
     """Startap tafsilotlari"""
@@ -399,19 +404,6 @@ def get_startup_details(startup_id):
         if not startup:
             return jsonify({'success': False, 'error': 'Startap topilmadi'}), 404
         
-        # Muallif ma'lumotlari
-        owner = get_user(startup.get('owner_id')) if startup.get('owner_id') else None
-        owner_info = None
-        if owner:
-            owner_info = {
-                'id': owner.get('user_id'),
-                'first_name': owner.get('first_name', ''),
-                'last_name': owner.get('last_name', ''),
-                'phone': owner.get('phone', ''),
-                'username': owner.get('username', ''),
-                'bio': owner.get('bio', '')
-            }
-        
         # Status matni
         status_texts = {
             'pending': '⏳ Kutilmoqda',
@@ -420,18 +412,6 @@ def get_startup_details(startup_id):
             'rejected': '❌ Rad etilgan'
         }
         
-        # Sana formatlash
-        def format_date(date_value):
-            if not date_value:
-                return None
-            if isinstance(date_value, datetime):
-                return date_value.strftime('%Y-%m-%d %H:%M')
-            elif isinstance(date_value, str):
-                if len(date_value) > 10:
-                    return date_value[:16]
-                return date_value
-            return str(date_value)
-        
         # A'zolar soni
         try:
             members, member_count = get_startup_members(startup_id, 1, 1000)
@@ -439,17 +419,34 @@ def get_startup_details(startup_id):
             member_count = 0
             members = []
         
+        # Owner info
+        owner_info = None
+        if startup.get('owner_id'):
+            owner_info = {
+                'id': startup.get('owner_id'),
+                'first_name': startup.get('owner_first_name', ''),
+                'last_name': startup.get('owner_last_name', ''),
+                'phone': startup.get('owner_phone', ''),
+                'username': startup.get('owner_username', '')
+            }
+        
+        # Log admin action
+        log_admin_action(session.get('admin_username'), 'view_startup_details', {
+            'startup_id': startup_id,
+            'startup_name': startup.get('name')
+        })
+        
         return jsonify({
             'success': True,
             'data': {
-                'id': str(startup.get('_id', '')),
+                'id': startup.get('id', ''),
                 'name': startup.get('name', ''),
                 'description': startup.get('description', ''),
                 'status': startup.get('status', ''),
                 'status_text': status_texts.get(startup.get('status'), startup.get('status')),
-                'created_at': format_date(startup.get('created_at')),
-                'started_at': format_date(startup.get('started_at')),
-                'ended_at': format_date(startup.get('ended_at')),
+                'created_at': startup.get('created_at'),
+                'started_at': startup.get('started_at'),
+                'ended_at': startup.get('ended_at'),
                 'results': startup.get('results', ''),
                 'group_link': startup.get('group_link', ''),
                 'logo': startup.get('logo', ''),
@@ -461,7 +458,7 @@ def get_startup_details(startup_id):
         logger.error(f"Startup details error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/startup/<startup_id>/approve', methods=['POST'])
+@app.route('/api/startup/<int:startup_id>/approve', methods=['POST'])
 @login_required
 def approve_startup(startup_id):
     """Startapni tasdiqlash"""
@@ -469,27 +466,36 @@ def approve_startup(startup_id):
         if not DB_AVAILABLE:
             return jsonify({'success': False, 'error': 'Database ulanmagan'}), 500
         
-        update_startup_status(startup_id, 'active')
-        logger.info(f"Startup approved: {startup_id}")
+        success = update_startup_status(startup_id, 'active')
         
-        # Bot orqali xabar yuborish
-        if BOT_AVAILABLE:
-            try:
-                startup = get_startup(startup_id)
-                if startup and startup.get('owner_id'):
-                    bot.send_message(
-                        startup['owner_id'],
-                        f"🎉 Tabriklaymiz! Sizning '{startup['name']}' startupingiz tasdiqlandi!"
-                    )
-            except Exception as e:
-                logger.error(f"Bot orqali xabar yuborishda xato: {e}")
-        
-        return jsonify({'success': True, 'message': 'Startap tasdiqlandi'})
+        if success:
+            logger.info(f"Startup approved: {startup_id}")
+            
+            # Log admin action
+            log_admin_action(session.get('admin_username'), 'approve_startup', {
+                'startup_id': startup_id
+            })
+            
+            # Bot orqali xabar yuborish
+            if BOT_AVAILABLE:
+                try:
+                    startup = get_startup(startup_id)
+                    if startup and startup.get('owner_id'):
+                        bot.send_message(
+                            startup['owner_id'],
+                            f"🎉 Tabriklaymiz! Sizning '{startup['name']}' startupingiz tasdiqlandi!"
+                        )
+                except Exception as e:
+                    logger.error(f"Bot orqali xabar yuborishda xato: {e}")
+            
+            return jsonify({'success': True, 'message': 'Startap tasdiqlandi'})
+        else:
+            return jsonify({'success': False, 'error': 'Startap topilmadi yoki yangilanmadi'}), 404
     except Exception as e:
         logger.error(f"Approve startup error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/startup/<startup_id>/reject', methods=['POST'])
+@app.route('/api/startup/<int:startup_id>/reject', methods=['POST'])
 @login_required
 def reject_startup(startup_id):
     """Startapni rad etish"""
@@ -497,22 +503,31 @@ def reject_startup(startup_id):
         if not DB_AVAILABLE:
             return jsonify({'success': False, 'error': 'Database ulanmagan'}), 500
         
-        update_startup_status(startup_id, 'rejected')
-        logger.info(f"Startup rejected: {startup_id}")
+        success = update_startup_status(startup_id, 'rejected')
         
-        # Bot orqali xabar yuborish
-        if BOT_AVAILABLE:
-            try:
-                startup = get_startup(startup_id)
-                if startup and startup.get('owner_id'):
-                    bot.send_message(
-                        startup['owner_id'],
-                        f"❌ Sizning '{startup['name']}' startupingiz rad etildi."
-                    )
-            except Exception as e:
-                logger.error(f"Bot orqali xabar yuborishda xato: {e}")
-        
-        return jsonify({'success': True, 'message': 'Startap rad etildi'})
+        if success:
+            logger.info(f"Startup rejected: {startup_id}")
+            
+            # Log admin action
+            log_admin_action(session.get('admin_username'), 'reject_startup', {
+                'startup_id': startup_id
+            })
+            
+            # Bot orqali xabar yuborish
+            if BOT_AVAILABLE:
+                try:
+                    startup = get_startup(startup_id)
+                    if startup and startup.get('owner_id'):
+                        bot.send_message(
+                            startup['owner_id'],
+                            f"❌ Sizning '{startup['name']}' startupingiz rad etildi."
+                        )
+                except Exception as e:
+                    logger.error(f"Bot orqali xabar yuborishda xato: {e}")
+            
+            return jsonify({'success': True, 'message': 'Startap rad etildi'})
+        else:
+            return jsonify({'success': False, 'error': 'Startap topilmadi yoki yangilanmadi'}), 404
     except Exception as e:
         logger.error(f"Reject startup error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -549,13 +564,30 @@ def broadcast_message():
             except Exception as e:
                 logger.error(f"Xabar yuborishda xato: {e}")
         
+        # Xabar ma'lumotlarini saqlash
+        message_id = save_broadcast_message(
+            message=message,
+            sent_by=session.get('admin_username'),
+            sent_count=sent_count,
+            failed_count=failed_count,
+            recipient_type=recipient_type
+        )
+        
+        # Log admin action
+        log_admin_action(session.get('admin_username'), 'send_broadcast', {
+            'message_length': len(message),
+            'sent_count': sent_count,
+            'failed_count': failed_count,
+            'recipient_type': recipient_type
+        })
+        
         logger.info(f"Broadcast message: {message[:50]}... (sent: {sent_count}, failed: {failed_count})")
         
         return jsonify({
             'success': True,
             'message': 'Xabar yuborildi',
             'data': {
-                'id': str(ObjectId()),
+                'id': message_id,
                 'message': message,
                 'recipient_type': recipient_type,
                 'sent_at': datetime.now().isoformat(),
@@ -572,7 +604,7 @@ def broadcast_message():
 @app.route('/api/analytics/user-growth')
 @login_required
 def get_user_growth():
-    """Foydalanuvchi o'sishi uchun analytics - FAQAT REAL MA'LUMOTLAR"""
+    """Foydalanuvchi o'sishi uchun analytics"""
     try:
         if not DB_AVAILABLE:
             return jsonify({'success': False, 'error': 'Database ulanmagan'}), 500
@@ -600,6 +632,11 @@ def get_user_growth():
                 'total_users': len([u for u in users if u.get('joined_at', '') <= date_str])
             })
         
+        # Log admin action
+        log_admin_action(session.get('admin_username'), 'view_analytics', {
+            'period': period
+        })
+        
         return jsonify({
             'success': True,
             'data': {
@@ -622,7 +659,7 @@ def get_user_growth():
 @app.route('/api/analytics/startup-distribution')
 @login_required
 def get_startup_distribution():
-    """Startap taqsimoti - FAQAT REAL MA'LUMOTLAR"""
+    """Startap taqsimoti"""
     try:
         if not DB_AVAILABLE:
             return jsonify({'success': False, 'error': 'Database ulanmagan'}), 500
@@ -670,7 +707,8 @@ def settings():
             
             if BOT_AVAILABLE:
                 try:
-                    bot_username = bot.get_me().username
+                    bot_info = bot.get_me()
+                    bot_username = bot_info.username if hasattr(bot_info, 'username') else 'Noma\'lum'
                 except:
                     bot_username = 'Noma\'lum'
             
@@ -678,19 +716,25 @@ def settings():
                 'success': True,
                 'data': {
                     'site_name': 'GarajHub',
-                    'admin_email': ADMINS.get('admin', {}).get('email', 'admin@garajhub.uz'),
+                    'admin_email': ADMIN_EMAIL,
                     'timezone': 'Asia/Tashkent',
                     'bot_token': os.environ.get('BOT_TOKEN', ''),
                     'bot_username': bot_username,
-                    'channel_username': os.environ.get('CHANNEL_USERNAME', '@GarajHub_uz'),
+                    'channel_username': CHANNEL_USERNAME,
                     'bot_status': bot_status,
-                    'database_status': 'online' if DB_AVAILABLE else 'offline'
+                    'database_status': 'online' if DB_AVAILABLE else 'offline',
+                    'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
             })
         else:
             # Sozlamalarni yangilash
             data = request.json
             logger.info(f"Settings update attempted: {data}")
+            
+            # Log admin action
+            log_admin_action(session.get('admin_username'), 'update_settings', {
+                'settings': data
+            })
             
             # Hozircha faqat log qilamiz, keyinchalik database ga saqlash mumkin
             return jsonify({
@@ -743,6 +787,56 @@ def get_backups():
         logger.error(f"Backups error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/dashboard/overview')
+@login_required
+def dashboard_overview():
+    """Dashboard uchun umumiy ma'lumotlar"""
+    try:
+        if not DB_AVAILABLE:
+            return jsonify({'success': False, 'error': 'Database ulanmagan'}), 500
+        
+        stats = get_statistics()
+        
+        # So'nggi startaplar
+        recent_startups = get_recent_startups(5)
+        
+        # So'nggi foydalanuvchilar
+        recent_users = get_recent_users(5)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'stats': {
+                    'total_users': stats.get('total_users', 0),
+                    'total_startups': stats.get('total_startups', 0),
+                    'active_startups': stats.get('active_startups', 0),
+                    'pending_startups': stats.get('pending_startups', 0)
+                },
+                'recent_startups': [
+                    {
+                        'id': s.get('id'),
+                        'name': s.get('name'),
+                        'owner': f"{s.get('owner_first_name', '')} {s.get('owner_last_name', '')}".strip(),
+                        'status': s.get('status'),
+                        'created_at': s.get('created_at')
+                    }
+                    for s in recent_startups
+                ],
+                'recent_users': [
+                    {
+                        'id': u.get('user_id'),
+                        'name': f"{u.get('first_name', '')} {u.get('last_name', '')}".strip(),
+                        'username': u.get('username'),
+                        'joined_at': u.get('joined_at')
+                    }
+                    for u in recent_users
+                ]
+            }
+        })
+    except Exception as e:
+        logger.error(f"Dashboard error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # ==================== ERROR HANDLERS ====================
 
 @app.errorhandler(404)
@@ -757,12 +851,15 @@ def internal_error(error):
 
 @app.route('/health')
 def health_check():
-    """Render uchun health check endpoint"""
+    """Health check endpoint"""
+    db_status = 'connected' if DB_AVAILABLE and check_database_connection() else 'disconnected'
+    
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'database': 'connected' if DB_AVAILABLE else 'disconnected',
-        'bot': 'available' if BOT_AVAILABLE else 'unavailable'
+        'database': db_status,
+        'bot': 'available' if BOT_AVAILABLE else 'unavailable',
+        'version': '1.0.0'
     })
 
 # ==================== MAIN ====================
@@ -772,7 +869,7 @@ if __name__ == '__main__':
     if DB_AVAILABLE:
         try:
             init_db()
-            print("✅ Database ishga tushirildi")
+            print("✅ PostgreSQL database ishga tushirildi")
         except Exception as e:
             print(f"⚠️ Database ishga tushirishda xato: {e}")
     else:
@@ -789,17 +886,17 @@ if __name__ == '__main__':
     else:
         print("⚠️ Bot mavjud emas")
     
-    # Portni environment dan olish yoki default - Render uchun
+    # Portni environment dan olish yoki default
     port = int(os.environ.get('PORT', 10000))
     
-    # Flask serverni ishga tushirish - Render uchun
-    print(f"🚀 Web admin panel Render'da ishga tushmoqda...")
+    # Flask serverni ishga tushirish
+    print(f"🚀 Web admin panel ishga tushmoqda...")
     print(f"🌐 Port: {port}")
     print(f"📊 Admin panel tayyor")
     print(f"🤖 Bot status: {'Online' if BOT_AVAILABLE else 'Offline'}")
     print(f"🗄️ Database status: {'Online' if DB_AVAILABLE else 'Offline'}")
     
-    # Debug mode'ni environment dan olish - Render uchun production mode
+    # Debug mode'ni environment dan olish
     debug_mode = os.environ.get('DEBUG', 'False').lower() == 'true'
     
     app.run(host='0.0.0.0', port=port, debug=debug_mode, use_reloader=False)
